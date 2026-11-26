@@ -3,16 +3,53 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(8);
 const FLUSH_BYTES: usize = 1024 * 1024;
+const MAX_UNACKED: usize = 5 * 1024 * 1024;
+const READ_QUEUE_CHUNKS: usize = 16;
+
+#[derive(Default)]
+struct FlowState {
+    unacked: usize,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct Flow {
+    state: Mutex<FlowState>,
+    acked: Condvar,
+}
+
+impl Flow {
+    fn wait_for_room(&self) {
+        let state = self.state.lock().unwrap();
+        drop(self.acked.wait_while(state, |s| s.unacked > MAX_UNACKED && !s.closed).unwrap());
+    }
+
+    fn sent(&self, bytes: usize) {
+        self.state.lock().unwrap().unacked += bytes;
+    }
+
+    fn ack(&self, bytes: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.unacked = state.unacked.saturating_sub(bytes);
+        self.acked.notify_all();
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.acked.notify_all();
+    }
+}
 
 struct Session {
     master: Box<dyn MasterPty + Send>,
     input: mpsc::Sender<Vec<u8>>,
     child: Box<dyn Child + Send + Sync>,
+    flow: Arc<Flow>,
 }
 
 #[derive(Default)]
@@ -30,6 +67,7 @@ impl PtyManager {
         on_data: impl Fn(Vec<u8>) + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> Result<(), String> {
+        self.kill(id);
         let pair = native_pty_system()
             .openpty(size(cols, rows))
             .map_err(|e| e.to_string())?;
@@ -37,18 +75,20 @@ impl PtyManager {
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(READ_QUEUE_CHUNKS);
         std::thread::spawn(move || read_loop(reader, tx));
         let (input, pending) = mpsc::channel();
         std::thread::spawn(move || write_loop(writer, pending));
+        let flow = Arc::new(Flow::default());
+        let batch_flow = flow.clone();
         std::thread::spawn(move || {
-            batch_loop(rx, on_data);
+            batch_loop(rx, &batch_flow, on_data);
             on_exit();
         });
         self.sessions
             .lock()
             .unwrap()
-            .insert(id, Session { master: pair.master, input, child });
+            .insert(id, Session { master: pair.master, input, child, flow });
         Ok(())
     }
 
@@ -64,9 +104,21 @@ impl PtyManager {
         session.master.resize(size(cols, rows)).map_err(|e| e.to_string())
     }
 
+    pub fn ack(&self, id: u32, bytes: usize) {
+        if let Some(session) = self.sessions.lock().unwrap().get(&id) {
+            session.flow.ack(bytes);
+        }
+    }
+
+    pub fn kill_all(&self) {
+        let ids: Vec<u32> = self.sessions.lock().unwrap().keys().copied().collect();
+        ids.into_iter().for_each(|id| self.kill(id));
+    }
+
     pub fn kill(&self, id: u32) {
         let removed = self.sessions.lock().unwrap().remove(&id);
         if let Some(mut session) = removed {
+            session.flow.close();
             let _ = session.child.kill();
             std::thread::spawn(move || {
                 let _ = session.child.wait();
@@ -97,10 +149,11 @@ fn size(cols: u16, rows: u16) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-fn read_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn read_loop(mut reader: Box<dyn Read + Send>, tx: mpsc::SyncSender<Vec<u8>>) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match reader.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 if tx.send(buf[..n].to_vec()).is_err() {
@@ -119,8 +172,10 @@ fn write_loop(mut writer: Box<dyn Write + Send>, pending: mpsc::Receiver<Vec<u8>
     }
 }
 
-fn batch_loop(rx: mpsc::Receiver<Vec<u8>>, on_data: impl Fn(Vec<u8>)) {
-    while let Ok(mut batch) = rx.recv() {
+fn batch_loop(rx: mpsc::Receiver<Vec<u8>>, flow: &Flow, on_data: impl Fn(Vec<u8>)) {
+    loop {
+        flow.wait_for_room();
+        let Ok(mut batch) = rx.recv() else { break };
         let deadline = Instant::now() + FLUSH_INTERVAL;
         while batch.len() < FLUSH_BYTES {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
@@ -128,6 +183,7 @@ fn batch_loop(rx: mpsc::Receiver<Vec<u8>>, on_data: impl Fn(Vec<u8>)) {
                 Err(_) => break,
             }
         }
+        flow.sent(batch.len());
         on_data(batch);
     }
 }
@@ -135,11 +191,7 @@ fn batch_loop(rx: mpsc::Receiver<Vec<u8>>, on_data: impl Fn(Vec<u8>)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use portable_pty::CommandBuilder;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
 
     fn sh(script: &str) -> CommandBuilder {
         let mut cmd = CommandBuilder::new("sh");
@@ -236,6 +288,39 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         mgr.kill(1);
         assert!(wait_until(Duration::from_secs(2), || Arc::strong_count(&token) == 1));
+    }
+
+    #[test]
+    fn unacknowledged_output_pauses_the_reader() {
+        let mgr = PtyManager::default();
+        let out = collect(&mgr, 1, "yes 0123456789 | head -c 50000000");
+        std::thread::sleep(Duration::from_secs(2));
+        let received = out.lock().unwrap().len();
+        assert!(received <= MAX_UNACKED + FLUSH_BYTES, "received {received}");
+        mgr.ack(1, received);
+        assert!(wait_until(Duration::from_secs(2), || out.lock().unwrap().len() > received));
+        mgr.kill(1);
+    }
+
+    #[test]
+    fn spawning_an_existing_id_replaces_the_old_session() {
+        let mgr = PtyManager::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = exited.clone();
+        mgr.spawn(1, sh("sleep 30"), 80, 24, |_| {}, move || flag.store(true, Ordering::SeqCst)).unwrap();
+        collect(&mgr, 1, "sleep 30");
+        assert!(wait_until(Duration::from_secs(2), || exited.load(Ordering::SeqCst)));
+        mgr.kill(1);
+    }
+
+    #[test]
+    fn kill_all_ends_every_session() {
+        let mgr = PtyManager::default();
+        collect(&mgr, 1, "sleep 30");
+        collect(&mgr, 2, "sleep 30");
+        mgr.kill_all();
+        assert!(mgr.write(1, b"x").is_err());
+        assert!(mgr.write(2, b"x").is_err());
     }
 
     #[test]

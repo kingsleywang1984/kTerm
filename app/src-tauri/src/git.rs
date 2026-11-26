@@ -1,8 +1,9 @@
 use serde::Serialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct RepoInfo {
     pub root: PathBuf,
     pub branch: Option<String>,
@@ -13,25 +14,52 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 pub(crate) fn git_with_codes(dir: &Path, args: &[&str], ok_codes: &[i32]) -> Result<String, String> {
-    let out = Command::new("git")
+    Ok(git_capped(dir, args, ok_codes, usize::MAX)?.unwrap_or_default())
+}
+
+pub(crate) fn git_capped(dir: &Path, args: &[&str], ok_codes: &[i32], max: usize) -> Result<Option<String>, String> {
+    let mut child = Command::new("git")
         .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["-c", "color.ui=never", "-c", "core.quotepath=off"])
         .args(args)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| e.to_string())?;
-    if !out.status.code().is_some_and(|c| ok_codes.contains(&c)) {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    let mut stdout = Vec::new();
+    let limit = max.saturating_add(1) as u64;
+    child.stdout.take().unwrap().take(limit).read_to_end(&mut stdout).map_err(|e| e.to_string())?;
+    if stdout.len() > max {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(None);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let mut stderr = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if !status.code().is_some_and(|c| ok_codes.contains(&c)) {
+        return Err(stderr.trim().to_string());
+    }
+    Ok(Some(String::from_utf8_lossy(&stdout).into_owned()))
+}
+
+pub(crate) fn repo_root(dir: &Path) -> Result<PathBuf, String> {
+    let root = git(dir, &["rev-parse", "--show-toplevel"]).map_err(|_| "Not a git repository".to_string())?;
+    Ok(PathBuf::from(root.trim()))
+}
+
+pub(crate) fn ref_exists(root: &Path, reference: &str) -> Result<bool, String> {
+    Ok(!git_with_codes(root, &["rev-parse", "--verify", "-q", reference], &[0, 1])?.trim().is_empty())
 }
 
 pub fn repo_info(dir: &Path) -> Option<RepoInfo> {
-    let root = git(dir, &["rev-parse", "--show-toplevel"]).ok()?;
+    let root = repo_root(dir).ok()?;
     let branch = git(dir, &["symbolic-ref", "--short", "-q", "HEAD"])
         .ok()
         .map(|b| b.trim().to_string());
-    Some(RepoInfo { root: PathBuf::from(root.trim()), branch })
+    Some(RepoInfo { root, branch })
 }
 
 #[derive(Debug, Serialize)]
@@ -56,7 +84,7 @@ pub fn list_targets(root: &Path) -> Result<Vec<GitTarget>, String> {
             Some(GitTarget { branch, worktree: Some(path), is_current })
         })
         .collect();
-    let free: Vec<GitTarget> = git(root, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?
+    let free: Vec<GitTarget> = git(root, &["for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads"])?
         .lines()
         .filter(|b| !targets.iter().any(|t| t.branch.as_deref() == Some(*b)))
         .map(|b| GitTarget { branch: Some(b.to_string()), worktree: None, is_current: false })
@@ -139,6 +167,15 @@ mod tests {
             [(Some("main"), Some(d.clone()), true), (Some("x"), Some(wt.clone()), false), (Some("y"), None, false)]
         );
         std::fs::remove_dir_all(wt).unwrap();
+    }
+
+    #[test]
+    fn targets_list_branch_shadowed_by_tag_by_its_name() {
+        let dir = repo();
+        run(dir.path(), &["tag", "foo"]);
+        run(dir.path(), &["branch", "foo"]);
+        let branches: Vec<_> = list_targets(dir.path()).unwrap().into_iter().filter_map(|t| t.branch).collect();
+        assert_eq!(branches, ["main", "foo"]);
     }
 
     #[test]

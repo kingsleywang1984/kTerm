@@ -6,32 +6,32 @@
   --muted: #888;
   --active: #37373d;
 }
-html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px -apple-system, sans-serif; }
+html, body { margin: 0; height: 100%; background: var(--panel); color: var(--text); font: 13px -apple-system, sans-serif; }
 body { display: flex; overflow: hidden; }
-button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
-#sidebar { width: 200px; flex-shrink: 0; background: var(--panel); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
-#tabs { list-style: none; margin: 0; padding: 6px; flex: 1; overflow-y: auto; }
-#tabs li { padding: 6px 8px; border-radius: 4px; cursor: pointer; }
-#tabs li.active { background: var(--active); }
-#tabs .row { display: flex; align-items: center; gap: 4px; }
-#tabs .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#tabs input { flex: 1; min-width: 0; font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--border); }
-#tabs .diff, #tabs .close { opacity: 0; padding: 0 2px; }
-#tabs li:hover .diff, #tabs li:hover .close, #tabs li.active .diff { opacity: 0.6; }
-#tabs .subtitle { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#tabs .subtitle:empty { display: none; }
-#new-tab { margin: 6px; background: var(--border); padding: 6px; border-radius: 4px; }
-#terminals { flex: 1; position: relative; min-width: 0; }
+input.rename { width: 100%; box-sizing: border-box; font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+#sidebar { width: 200px; flex-shrink: 0; overflow: hidden; display: flex; flex-direction: column; }
+.resize-handle { width: 4px; flex-shrink: 0; cursor: col-resize; }
+.diff-body .resize-handle { background: var(--border); }
+.resize-handle:hover, .diff-body .resize-handle:hover { background: #007acc; }
+#workspaces { list-style: none; margin: 0; padding: 8px 6px; flex: 1; overflow-y: auto; }
+#workspaces li { padding: 6px 8px; border-radius: 4px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#workspaces li.active { background: var(--active); }
+#main { flex: 1; min-width: 0; display: flex; padding: 8px 8px 8px 4px; }
+#card { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+#tabbar { display: flex; gap: 2px; padding: 4px 6px 0; border-bottom: 1px solid var(--border); overflow-x: auto; flex-shrink: 0; }
+#tabbar .tab { padding: 5px 12px; border-radius: 6px 6px 0 0; cursor: pointer; color: var(--muted); white-space: nowrap; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+#tabbar .tab.active { background: var(--active); color: var(--text); }
+#terminals { flex: 1; position: relative; min-height: 0; }
 .term { position: absolute; inset: 0; padding: 4px; display: none; }
 .term.active { display: block; }
+#statusbar { display: flex; gap: 16px; padding: 3px 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; flex-shrink: 0; min-height: 15px; }
 .diff-view { position: absolute; inset: 0; z-index: 10; background: var(--bg); display: flex; flex-direction: column; outline: none; }
 .diff-view header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
 .diff-title { font-weight: 600; }
 .diff-count { color: var(--muted); flex: 1; }
-.diff-view header button { padding: 2px 8px; border-radius: 4px; background: var(--border); }
 .diff-body { flex: 1; display: flex; min-height: 0; }
-.diff-files { list-style: none; margin: 0; padding: 6px; width: 280px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border); }
-.diff-files li { display: flex; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.diff-files { list-style: none; margin: 0; padding: 6px 0; width: 280px; flex-shrink: 0; overflow-x: hidden; overflow-y: auto; }
+.diff-files li { display: flex; gap: 6px; margin: 0 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
 .diff-files li.selected { background: var(--active); }
 .diff-files .path { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .diff-files .stat { color: var(--muted); font-size: 11px; }

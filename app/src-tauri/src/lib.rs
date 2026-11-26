@@ -65,19 +65,36 @@ fn pty_resize(id: u32, cols: u16, rows: u16, ptys: State<PtyManager>) -> Result<
 }
 
 #[tauri::command]
-fn pty_kill(id: u32, ptys: State<PtyManager>) {
+async fn pty_kill(id: u32, ptys: State<'_, PtyManager>) -> Result<(), String> {
     ptys.kill(id);
+    Ok(())
 }
 
 #[tauri::command]
-async fn tab_location(id: u32, ptys: State<'_, PtyManager>) -> Result<Option<TabLocation>, String> {
+async fn pty_kill_all(ptys: State<'_, PtyManager>) -> Result<(), String> {
+    ptys.kill_all();
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_ack(id: u32, bytes: usize, ptys: State<PtyManager>) {
+    ptys.ack(id, bytes);
+}
+
+#[tauri::command]
+async fn tab_location(id: u32, with_git: bool, ptys: State<'_, PtyManager>) -> Result<Option<TabLocation>, String> {
     let Some(cwd) = ptys.foreground_cwd(id) else { return Ok(None) };
-    let repo = git::repo_info(&cwd);
+    let repo = with_git.then(|| git::repo_info(&cwd)).flatten();
     Ok(Some(TabLocation {
         cwd: cwd.to_string_lossy().into_owned(),
         repo_root: repo.as_ref().map(|r| r.root.to_string_lossy().into_owned()),
         branch: repo.and_then(|r| r.branch),
     }))
+}
+
+#[tauri::command]
+async fn pin_status(target: DiffTarget) -> Result<Option<diff::PinStatus>, String> {
+    diff::pin_status(&target)
 }
 
 #[tauri::command]
@@ -137,7 +154,7 @@ pub fn run() {
     tauri::Builder::default()
         .menu(app_menu)
         .manage(PtyManager::default())
-        .invoke_handler(tauri::generate_handler![pty_spawn, pty_write, pty_resize, pty_kill, tab_location, diff_summary, diff_patch, git_targets, stress_mode, mark])
+        .invoke_handler(tauri::generate_handler![pty_spawn, pty_write, pty_resize, pty_kill, pty_kill_all, pty_ack, tab_location, pin_status, diff_summary, diff_patch, git_targets, stress_mode, mark])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

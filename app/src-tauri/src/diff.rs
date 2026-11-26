@@ -1,4 +1,5 @@
-use crate::git::{git, git_with_codes};
+use crate::git::{git, git_capped, ref_exists, repo_root};
+use std::io::Read;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -39,35 +40,58 @@ pub struct Patch {
     pub truncated: bool,
 }
 
-pub fn default_branch(root: &Path) -> Option<String> {
+#[derive(Debug, Serialize)]
+pub struct PinStatus {
+    pub branch: Option<String>,
+}
+
+pub fn pin_status(target: &DiffTarget) -> Result<Option<PinStatus>, String> {
+    match target {
+        DiffTarget::WorkTree { dir } => {
+            if !dir.exists() {
+                return Ok(None);
+            }
+            let info = crate::git::repo_info(dir).ok_or("cannot read worktree")?;
+            Ok(Some(PinStatus { branch: info.branch }))
+        }
+        DiffTarget::Branch { root, branch } => {
+            if !root.exists() {
+                return Ok(None);
+            }
+            let found = ref_exists(root, &format!("refs/heads/{branch}"))?;
+            Ok(found.then(|| PinStatus { branch: Some(branch.clone()) }))
+        }
+    }
+}
+
+fn default_branch(root: &Path) -> Option<String> {
     if let Ok(remote) = git(root, &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]) {
         return Some(remote.trim().to_string());
     }
     ["main", "master"]
         .into_iter()
-        .find(|b| git(root, &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")]).is_ok())
+        .find(|b| ref_exists(root, &format!("refs/heads/{b}")).unwrap_or(false))
         .map(String::from)
 }
 
-pub fn base(target: &DiffTarget) -> Result<String, String> {
-    let root = repo_root(target)?;
+fn base(root: &Path, target: &DiffTarget) -> Result<String, String> {
     let head = head_ref(target);
-    if git(&root, &["rev-parse", "--verify", "-q", &format!("{head}^{{commit}}")]).is_err() {
+    if !ref_exists(root, &format!("{head}^{{commit}}"))? {
         return match target {
             DiffTarget::WorkTree { .. } => Ok(EMPTY_TREE.to_string()),
             DiffTarget::Branch { branch, .. } => Err(format!("unknown branch {branch}")),
         };
     }
-    let fork = default_branch(&root).and_then(|d| git(&root, &["merge-base", &d, head]).ok());
+    let fork = default_branch(root).and_then(|d| git(root, &["merge-base", &d, &head]).ok());
     match fork {
         Some(commit) => Ok(commit.trim().to_string()),
-        None => Ok(git(&root, &["rev-parse", head])?.trim().to_string()),
+        None => Ok(git(root, &["rev-parse", &head])?.trim().to_string()),
     }
 }
 
 pub fn summary(target: &DiffTarget) -> Result<Vec<FileChange>, String> {
-    let root = repo_root(target)?;
-    let range = range(target)?;
+    let root = repo_root(target_dir(target))?;
+    let range = range(&root, target)?;
     let mut changes = tracked_changes(&root, &range)?;
     if matches!(target, DiffTarget::WorkTree { .. }) {
         for path in untracked(&root, None)? {
@@ -79,66 +103,63 @@ pub fn summary(target: &DiffTarget) -> Result<Vec<FileChange>, String> {
 }
 
 pub fn patch(target: &DiffTarget, path: &str, old_path: Option<&str>) -> Result<Patch, String> {
-    let root = repo_root(target)?;
+    let root = repo_root(target_dir(target))?;
     let is_untracked =
         matches!(target, DiffTarget::WorkTree { .. }) && !untracked(&root, Some(path))?.is_empty();
-    let text = if is_untracked {
-        git_with_codes(&root, &["diff", "--no-index", "--", "/dev/null", path], &[0, 1])?
+    let mut args: Vec<String> = ["diff", "--no-ext-diff", "--no-textconv"].map(String::from).into();
+    if is_untracked {
+        args.extend(["--no-index", "--", "/dev/null", path].map(String::from));
     } else {
-        let mut args = vec!["diff".to_string(), "--find-renames".to_string()];
-        args.extend(range(target)?);
+        args.push("--find-renames".into());
+        args.extend(range(&root, target)?);
         args.push("--".into());
         args.extend(old_path.map(String::from));
         args.push(path.into());
-        git(&root, &args.iter().map(String::as_str).collect::<Vec<_>>())?
-    };
-    if text.len() > MAX_PATCH_BYTES {
-        return Ok(Patch { text: String::new(), truncated: true });
     }
-    Ok(Patch { text, truncated: false })
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(match git_capped(&root, &args, &[0, 1], MAX_PATCH_BYTES)? {
+        Some(text) => Patch { text, truncated: false },
+        None => Patch { text: String::new(), truncated: true },
+    })
 }
 
-fn repo_root(target: &DiffTarget) -> Result<PathBuf, String> {
-    let dir = match target {
+fn target_dir(target: &DiffTarget) -> &Path {
+    match target {
         DiffTarget::WorkTree { dir } => dir,
         DiffTarget::Branch { root, .. } => root,
-    };
-    let root = git(dir, &["rev-parse", "--show-toplevel"]).map_err(|_| "Not a git repository".to_string())?;
-    Ok(PathBuf::from(root.trim()))
-}
-
-fn head_ref(target: &DiffTarget) -> &str {
-    match target {
-        DiffTarget::WorkTree { .. } => "HEAD",
-        DiffTarget::Branch { branch, .. } => branch,
     }
 }
 
-fn range(target: &DiffTarget) -> Result<Vec<String>, String> {
-    let base = base(target)?;
+fn head_ref(target: &DiffTarget) -> String {
+    match target {
+        DiffTarget::WorkTree { .. } => "HEAD".into(),
+        DiffTarget::Branch { branch, .. } => format!("refs/heads/{branch}"),
+    }
+}
+
+fn range(root: &Path, target: &DiffTarget) -> Result<Vec<String>, String> {
+    let base = base(root, target)?;
     Ok(match target {
         DiffTarget::WorkTree { .. } => vec![base],
-        DiffTarget::Branch { branch, .. } => vec![base, branch.clone()],
+        DiffTarget::Branch { .. } => vec![base, head_ref(target)],
     })
 }
 
 fn tracked_changes(root: &Path, range: &[String]) -> Result<Vec<FileChange>, String> {
     let diff_args = |mode: &'static str| {
-        let mut args = vec!["diff", "-z", mode, "--find-renames"];
+        let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "-z", mode, "--find-renames"];
         args.extend(range.iter().map(String::as_str));
+        args.push("--");
         args
     };
     let statuses = git(root, &diff_args("--name-status"))?;
     let numstat = git(root, &diff_args("--numstat"))?;
-    let counts = parse_numstat(&numstat);
+    let counts: std::collections::HashMap<String, (u32, u32, bool)> =
+        parse_numstat(&numstat).into_iter().map(|(p, a, d, b)| (p, (a, d, b))).collect();
     Ok(parse_name_status(&statuses)
         .into_iter()
         .map(|(status, path, old_path)| {
-            let (additions, deletions, binary) = counts
-                .iter()
-                .find(|(p, ..)| *p == path)
-                .map(|&(_, a, d, b)| (a, d, b))
-                .unwrap_or((0, 0, false));
+            let (additions, deletions, binary) = counts.get(&path).copied().unwrap_or((0, 0, false));
             FileChange { path, old_path, status, additions, deletions, binary }
         })
         .collect())
@@ -154,7 +175,7 @@ fn parse_name_status(out: &str) -> Vec<(Status, String, Option<String>)> {
             b'R' => Status::Renamed,
             _ => Status::Modified,
         };
-        if code.starts_with('R') || code.starts_with('C') {
+        if status == Status::Renamed {
             let (Some(old), Some(new)) = (tokens.next(), tokens.next()) else { break };
             result.push((status, new.to_string(), Some(old.to_string())));
         } else if let Some(path) = tokens.next() {
@@ -197,9 +218,14 @@ fn untracked(root: &Path, path: Option<&str>) -> Result<Vec<String>, String> {
 }
 
 fn untracked_change(root: &Path, path: String) -> FileChange {
-    let bytes = std::fs::read(root.join(&path)).unwrap_or_default();
-    let binary = bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0);
-    let additions = if binary {
+    let full = root.join(&path);
+    let regular = std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_file());
+    let mut bytes = Vec::new();
+    if regular {
+        let _ = std::fs::File::open(&full).map(|f| f.take(MAX_PATCH_BYTES as u64 + 1).read_to_end(&mut bytes));
+    }
+    let binary = !regular || bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0);
+    let additions = if binary || bytes.len() > MAX_PATCH_BYTES {
         0
     } else {
         let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
@@ -212,7 +238,6 @@ fn untracked_change(root: &Path, path: String) -> FileChange {
 mod tests {
     use super::*;
     use crate::git::testutil::*;
-    use std::path::Path;
     use tempfile::TempDir;
 
     fn work_tree(dir: &Path) -> DiffTarget {
@@ -353,6 +378,84 @@ mod tests {
         init(&nested);
         commit_file(&nested, "f.txt", "f\n");
         assert!(summary(&work_tree(dir.path())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn worktree_pin_is_gone_when_dir_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let target = work_tree(&dir.path().join("deleted"));
+        assert!(pin_status(&target).unwrap().is_none());
+    }
+
+    #[test]
+    fn worktree_pin_errors_when_git_cannot_read_it() {
+        let dir = TempDir::new().unwrap();
+        assert!(pin_status(&work_tree(dir.path())).is_err());
+    }
+
+    #[test]
+    fn worktree_pin_reports_its_branch() {
+        let dir = repo();
+        assert_eq!(pin_status(&work_tree(dir.path())).unwrap().unwrap().branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn branch_pin_is_gone_when_branch_is_deleted() {
+        let dir = repo();
+        let target = DiffTarget::Branch { root: dir.path().to_path_buf(), branch: "feat".into() };
+        assert!(pin_status(&target).unwrap().is_none());
+        run(dir.path(), &["branch", "feat"]);
+        assert_eq!(pin_status(&target).unwrap().unwrap().branch.as_deref(), Some("feat"));
+    }
+
+    #[test]
+    fn branch_named_like_a_directory_still_diffs() {
+        let dir = repo();
+        let d = dir.path();
+        run(d, &["checkout", "-q", "-b", "docs"]);
+        commit_file(d, "docs/a.md", "a\n");
+        run(d, &["checkout", "-q", "main"]);
+        std::fs::create_dir_all(d.join("docs")).unwrap();
+        let target = DiffTarget::Branch { root: d.to_path_buf(), branch: "docs".into() };
+        assert_eq!(paths(&summary(&target).unwrap()), ["docs/a.md"]);
+        assert!(patch(&target, "docs/a.md", None).unwrap().text.contains("+a"));
+    }
+
+    #[test]
+    fn branch_shadowed_by_tag_uses_the_branch() {
+        let dir = repo();
+        let d = dir.path();
+        run(d, &["tag", "foo"]);
+        run(d, &["checkout", "-q", "-b", "foo"]);
+        commit_file(d, "f.txt", "f\n");
+        run(d, &["checkout", "-q", "main"]);
+        let target = DiffTarget::Branch { root: d.to_path_buf(), branch: "foo".into() };
+        assert_eq!(paths(&summary(&target).unwrap()), ["f.txt"]);
+        assert!(pin_status(&target).unwrap().is_some());
+    }
+
+    #[test]
+    fn user_git_config_does_not_change_patch_format() {
+        let dir = repo();
+        let d = dir.path();
+        run(d, &["config", "color.ui", "always"]);
+        run(d, &["config", "diff.external", "echo EXTERNAL"]);
+        std::fs::write(d.join("README"), "changed\n").unwrap();
+        let text = patch(&work_tree(d), "README", None).unwrap().text;
+        assert!(text.contains("+changed"), "{text}");
+        assert!(!text.contains('\x1b'));
+    }
+
+    #[test]
+    fn untracked_fifo_does_not_block_summary() {
+        let dir = repo();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let target = work_tree(dir.path());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(summary(&target).is_ok()).unwrap());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(3)), Ok(true));
     }
 
     #[test]

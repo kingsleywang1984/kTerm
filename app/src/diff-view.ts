@@ -2,6 +2,7 @@ import "diff2html/bundles/css/diff2html.min.css";
 import { Diff2HtmlUI } from "diff2html/lib/ui/js/diff2html-ui-slim";
 import { ColorSchemeType } from "diff2html/lib/types";
 import { DiffTarget, FileChange, diffPatch, diffSummary } from "./api";
+import { CollapsiblePanel } from "./resizer";
 
 const STATUS_LETTER = { added: "A", modified: "M", deleted: "D", renamed: "R" } as const;
 
@@ -9,24 +10,27 @@ export class DiffView {
   private readonly el: HTMLElement;
   private readonly files: HTMLElement;
   private readonly patch: HTMLElement;
+  private readonly filesPanel: CollapsiblePanel;
   private request = 0;
 
-  constructor(parent: HTMLElement, private readonly target: DiffTarget | undefined, title: string, onClose: () => void) {
+  constructor(parent: HTMLElement, private readonly target: DiffTarget | undefined, title: string) {
     this.el = document.createElement("div");
     this.el.className = "diff-view";
     this.el.tabIndex = -1;
     this.el.innerHTML = `
-      <header><span class="diff-title"></span><span class="diff-count"></span>
-        <button class="refresh">Refresh</button><button class="close" title="Close (Esc)">×</button></header>
-      <div class="diff-body"><ul class="diff-files"></ul><div class="diff-patch"></div></div>`;
+      <header><span class="diff-title"></span><span class="diff-count"></span></header>
+      <div class="diff-body"><ul class="diff-files"></ul><div class="resize-handle"></div><div class="diff-patch"></div></div>`;
     this.el.querySelector(".diff-title")!.textContent = title;
-    (this.el.querySelector(".refresh") as HTMLElement).onclick = () => this.load();
-    (this.el.querySelector(".close") as HTMLElement).onclick = onClose;
     this.files = this.el.querySelector(".diff-files")!;
     this.patch = this.el.querySelector(".diff-patch")!;
     parent.appendChild(this.el);
+    this.filesPanel = new CollapsiblePanel(this.el.querySelector(".resize-handle")!, this.files, 150, 800);
     this.el.focus();
-    this.load();
+    this.refresh();
+  }
+
+  toggleFiles(): void {
+    this.filesPanel.toggle();
   }
 
   dispose(): void {
@@ -34,7 +38,7 @@ export class DiffView {
     this.el.remove();
   }
 
-  private async load(): Promise<void> {
+  async refresh(): Promise<void> {
     const request = ++this.request;
     this.files.replaceChildren();
     if (!this.target) return this.message("Not a git repository");

@@ -1,54 +1,144 @@
 import "@xterm/xterm/css/xterm.css";
-import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DiffTarget, tabLocation } from "./api";
+import { homeDir } from "@tauri-apps/api/path";
+import { DiffTarget, pinStatus, ptyKillAll, stressMode, tabLocation } from "./api";
 import type { DiffView } from "./diff-view";
 import { GitPanel } from "./git-panel";
+import { CollapsiblePanel } from "./resizer";
 import { Sidebar } from "./sidebar";
-import { TabStore, tabTitle } from "./tabs";
+import { StatusBar } from "./status-bar";
+import { TabBar } from "./tab-bar";
+import { Pin, TabInfo, diffTargetFor, pinRefresh, tabTitle } from "./tabs";
 import { TerminalTab } from "./terminal-tab";
+import { Workspace, WorkspaceStore } from "./workspaces";
 
 const LOCATION_POLL_MS = 3000;
 
-const store = new TabStore();
+const store = new WorkspaceStore();
 const terminals = new Map<number, TerminalTab>();
 const container = document.getElementById("terminals")!;
-const sidebar = new Sidebar(document.getElementById("tabs")!, {
-  select: activate,
-  close: closeTab,
-  diff: (id) => {
-    activate(id);
-    openTabDiff(id);
-  },
-  rename: (id, title) => {
-    store.update(id, { manualTitle: title });
+const sidebar = new Sidebar(document.getElementById("workspaces")!, {
+  select: activateWorkspace,
+  rename: (id, name) => {
+    const ws = store.get(id);
+    if (ws) ws.name = name;
   },
 });
+const tabBar = new TabBar(document.getElementById("tabbar")!, {
+  select: activateTerminal,
+  rename: (id, title) => {
+    const tab = store.terminal(id);
+    if (tab) tab.manualTitle = title;
+    render();
+  },
+});
+const statusBar = new StatusBar(document.getElementById("statusbar")!);
+let visibleId: number | undefined;
+let openToken = 0;
 
-async function newTab(): Promise<TerminalTab> {
-  const info = store.add();
+function visible(): TerminalTab | undefined {
+  return visibleId === undefined ? undefined : terminals.get(visibleId);
+}
+
+function addWorkspace(): Workspace {
+  const ws = store.addWorkspace();
+  sidebar.add(ws);
+  store.activate(ws.id);
+  return ws;
+}
+
+async function newWorkspace(): Promise<TerminalTab> {
+  return newTerminal(addWorkspace().id);
+}
+
+async function newTerminal(workspaceId: number): Promise<TerminalTab> {
+  const info = store.addTerminal(workspaceId);
   const terminal = new TerminalTab(info.id, container);
+  terminal.onTitle = (title) => {
+    const ws = store.workspaceOf(info.id);
+    if (ws?.tabs.update(info.id, { programTitle: title }) && ws === store.active()) scheduleRender();
+  };
   terminals.set(info.id, terminal);
-  sidebar.add(info);
-  activate(info.id);
+  render();
   await terminal.start();
   return terminal;
+}
+
+let renderScheduled = false;
+
+function scheduleRender(): void {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    render();
+  });
+}
+
+function render(): void {
+  const ws = store.active();
+  const tab = store.activeTerminal();
+  if (visibleId !== tab?.id) {
+    openToken++;
+    closeGitPanel();
+    closeDiff();
+    visible()?.hide();
+    visibleId = tab?.id;
+    visible()?.show();
+    if (tab) refreshLocation(tab).then((changed) => changed && render());
+  }
+  if (!diffView && !gitPanel && !(document.activeElement instanceof HTMLInputElement)) visible()?.focus();
+  sidebar.setActive(ws?.id);
+  tabBar.render(ws);
+  statusBar.render(tab);
+}
+
+function activateWorkspace(id: number): void {
+  store.activate(id);
+  render();
+}
+
+function activateTerminal(id: number): void {
+  const ws = store.workspaceOf(id);
+  if (!ws) return;
+  store.activate(ws.id);
+  ws.tabs.activate(id);
+  render();
+}
+
+function closeTerminal(id: number): void {
+  const terminal = terminals.get(id);
+  const ws = store.workspaceOf(id);
+  if (!terminal || !ws) return;
+  if (visibleId === id) {
+    closeGitPanel();
+    closeDiff();
+    visibleId = undefined;
+  }
+  terminal.dispose();
+  terminals.delete(id);
+  store.removeTerminal(id);
+  if (!store.get(ws.id)) sidebar.remove(ws.id);
+  if (store.all().length === 0) newWorkspace();
+  else render();
 }
 
 let diffView: DiffView | undefined;
 
 async function openDiff(target: DiffTarget | undefined, title: string): Promise<void> {
+  const token = ++openToken;
   closeDiff();
   const { DiffView } = await import("./diff-view");
+  if (token !== openToken) return;
   closeDiff();
-  diffView = new DiffView(container, target, title, closeDiff);
+  diffView = new DiffView(container, target, title);
 }
 
 function closeDiff(): void {
   if (!diffView) return;
   diffView.dispose();
   diffView = undefined;
-  if (store.activeId !== undefined) terminals.get(store.activeId)?.focus();
+  visible()?.focus();
 }
 
 let gitPanel: GitPanel | undefined;
@@ -56,70 +146,72 @@ let gitPanel: GitPanel | undefined;
 function closeGitPanel(): void {
   gitPanel?.dispose();
   gitPanel = undefined;
-  if (!diffView && store.activeId !== undefined) terminals.get(store.activeId)?.focus();
+  if (!diffView) visible()?.focus();
 }
 
-async function openGitPanel(id: number): Promise<void> {
-  const location = await tabLocation(id).catch(() => null);
+async function openGitPanel(tab: TabInfo): Promise<void> {
+  if (!(await refreshBeforeOpen(tab))) return;
   closeGitPanel();
-  gitPanel = new GitPanel(container, location?.repoRoot ?? undefined, (target, title) => {
+  gitPanel = new GitPanel(container, tab.repoRoot, tab.pin, (pin) => {
     closeGitPanel();
-    openDiff(target, title);
+    setPin(tab, pin);
+    if (pin) openDiff(pin.target, pin.label);
   });
 }
 
-async function openTabDiff(id: number): Promise<void> {
-  const tab = store.get(id);
-  if (!tab) return;
-  const location = await tabLocation(id).catch(() => null);
-  const target: DiffTarget | undefined = location?.repoRoot ? { kind: "workTree", dir: location.cwd } : undefined;
-  await openDiff(target, tabTitle(tab));
+function setPin(tab: TabInfo, pin: Pin | undefined): void {
+  tab.pin = pin;
+  tab.pinnedBranch = undefined;
+  render();
 }
 
-function activate(id: number): void {
-  closeGitPanel();
-  closeDiff();
-  const current = store.activeId;
-  if (current !== undefined && current !== id) terminals.get(current)?.hide();
-  show(id);
+async function refreshBeforeOpen(tab: TabInfo): Promise<boolean> {
+  const token = ++openToken;
+  if (await refreshLocation(tab)) render();
+  return token === openToken && visibleId === tab.id;
 }
 
-function show(id: number): void {
-  store.activate(id);
-  terminals.get(id)?.show();
-  sidebar.setActive(id);
+async function openTabDiff(tab: TabInfo): Promise<void> {
+  if (!(await refreshBeforeOpen(tab))) return;
+  await openDiff(diffTargetFor(tab), tab.pin?.label ?? tabTitle(tab));
 }
 
-function closeTab(id: number): void {
-  const terminal = terminals.get(id);
-  if (!terminal) return;
-  terminal.dispose();
-  terminals.delete(id);
-  sidebar.remove(id);
-  const wasActive = store.activeId === id;
-  if (wasActive) {
-    closeGitPanel();
-    closeDiff();
+async function refreshLocation(tab: TabInfo): Promise<boolean> {
+  const withGit = tab.id === visibleId;
+  const location = await tabLocation(tab.id, withGit).catch(() => null);
+  const tabs = store.workspaceOf(tab.id)?.tabs;
+  if (!tabs) return false;
+  let changed = false;
+  if (location) {
+    changed = tabs.update(
+      tab.id,
+      withGit
+        ? { cwd: location.cwd, repoRoot: location.repoRoot ?? undefined, branch: location.branch ?? undefined }
+        : { cwd: location.cwd },
+    );
   }
-  const next = store.remove(id);
-  if (next === undefined) newTab();
-  else if (wasActive) show(next);
+  const pin = tab.pin;
+  if (pin && withGit) {
+    const info = await pinStatus(pin.target).catch(() => undefined);
+    const patch = pinRefresh(pin, tab.pin, info);
+    if (patch) changed = tabs.update(tab.id, patch) || changed;
+  }
+  return changed;
 }
 
-async function refreshLocations(): Promise<void> {
-  for (const tab of store.list()) {
-    const location = await tabLocation(tab.id).catch(() => null);
-    if (!location) continue;
-    const changed = store.update(tab.id, {
-      cwd: location.cwd,
-      repoRoot: location.repoRoot ?? undefined,
-      branch: location.branch ?? undefined,
-    });
-    if (changed) sidebar.refresh(tab);
-  }
+async function pollLocations(): Promise<void> {
+  let changed = false;
+  for (const tab of store.terminals()) changed = (await refreshLocation(tab)) || changed;
+  if (changed) render();
+  setTimeout(pollLocations, LOCATION_POLL_MS);
+}
+
+function cycleTerminal(delta: number): void {
+  if (store.cycle(delta)) render();
 }
 
 function onKeyDown(e: KeyboardEvent): void {
+  if (e.key === "Escape") openToken++;
   if (e.key === "Escape" && (gitPanel || diffView)) {
     e.preventDefault();
     if (gitPanel) closeGitPanel();
@@ -127,15 +219,22 @@ function onKeyDown(e: KeyboardEvent): void {
     return;
   }
   if (!e.metaKey || e.altKey || e.ctrlKey) return;
-  const active = store.activeId;
+  const ws = store.active();
+  const tab = store.activeTerminal();
+  const key = e.shiftKey ? `⇧${e.code}` : e.code;
   let handled = true;
-  if (e.key === "t") newTab();
-  else if (e.key === "w" && active !== undefined) closeTab(active);
-  else if (e.key === "d" && active !== undefined) diffView ? closeDiff() : openTabDiff(active);
-  else if (e.key === "g" && active !== undefined) gitPanel ? closeGitPanel() : openGitPanel(active);
-  else if (/^[1-9]$/.test(e.key)) {
-    const tab = store.byIndex(Number(e.key) - 1);
-    if (tab) activate(tab.id);
+  if (key === "⇧KeyT") newWorkspace();
+  else if (key === "KeyT" && ws) newTerminal(ws.id);
+  else if (key === "KeyW" && tab) closeTerminal(tab.id);
+  else if (key === "⇧BracketLeft") cycleTerminal(-1);
+  else if (key === "⇧BracketRight") cycleTerminal(1);
+  else if (key === "KeyD" && tab) diffView ? closeDiff() : openTabDiff(tab);
+  else if (key === "KeyG" && tab) gitPanel ? closeGitPanel() : openGitPanel(tab);
+  else if (key === "KeyR" && diffView) diffView.refresh();
+  else if (key === "KeyB") diffView ? diffView.toggleFiles() : sidebarPanel.toggle();
+  else if (/^Digit[1-9]$/.test(key)) {
+    const target = store.byIndex(Number(key.slice(5)) - 1);
+    if (target) activateWorkspace(target.id);
   } else handled = false;
   if (handled) {
     e.preventDefault();
@@ -143,15 +242,24 @@ function onKeyDown(e: KeyboardEvent): void {
   }
 }
 
+const sidebarPanel = new CollapsiblePanel(document.getElementById("sidebar-handle")!, document.getElementById("sidebar")!, 120, 600);
+new ResizeObserver(() => visible()?.fit()).observe(container);
 window.addEventListener("keydown", onKeyDown, true);
-window.addEventListener("resize", () => {
-  if (store.activeId !== undefined) terminals.get(store.activeId)?.fit();
-});
-document.getElementById("new-tab")!.onclick = () => newTab();
-listen<number>("pty-exit", (e) => closeTab(e.payload));
-setInterval(refreshLocations, LOCATION_POLL_MS);
-invoke<boolean>("stress_mode").then(async (on) => {
-  if (!on) return void newTab();
+listen<number>("pty-exit", (e) => closeTerminal(e.payload));
+setTimeout(pollLocations, LOCATION_POLL_MS);
+homeDir()
+  .then((home) => {
+    statusBar.home = home;
+    render();
+  })
+  .catch(() => {});
+Promise.all([ptyKillAll().catch(() => {}), stressMode()]).then(async ([, on]) => {
+  if (!on) return void newWorkspace();
+  addWorkspace();
   const { stress } = await import("./stress");
-  stress({ newTab, closeTab, activate });
+  stress({
+    newTab: () => newTerminal(store.activeId!),
+    closeTab: closeTerminal,
+    activate: activateTerminal,
+  });
 });

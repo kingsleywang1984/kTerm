@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { ptyWrite } from "./api";
+import { mark, ptyWrite } from "./api";
 import { TerminalTab } from "./terminal-tab";
 
 export type StressHost = {
@@ -10,7 +9,6 @@ export type StressHost = {
 
 const MARKER = "__DONE__";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const mark = (label: string) => invoke("mark", { label });
 
 function runAndWait(tab: TerminalTab, cmd: string, timeoutMs = 60000): Promise<boolean> {
   return new Promise((resolve) => {

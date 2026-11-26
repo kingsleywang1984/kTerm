@@ -11,7 +11,12 @@ export function ptySpawn(id: number, cols: number, rows: number, onData: (bytes:
 export const ptyWrite = (id: number, data: string) => invoke<void>("pty_write", { id, data });
 export const ptyResize = (id: number, cols: number, rows: number) => invoke<void>("pty_resize", { id, cols, rows });
 export const ptyKill = (id: number) => invoke<void>("pty_kill", { id });
-export const tabLocation = (id: number) => invoke<TabLocation | null>("tab_location", { id });
+export const ptyKillAll = () => invoke<void>("pty_kill_all");
+export const ptyAck = (id: number, bytes: number) => invoke<void>("pty_ack", { id, bytes });
+export const pinStatus = (target: DiffTarget) => invoke<{ branch: string | null } | null>("pin_status", { target });
+export const tabLocation = (id: number, withGit: boolean) => invoke<TabLocation | null>("tab_location", { id, withGit });
+export const stressMode = () => invoke<boolean>("stress_mode");
+export const mark = (label: string) => invoke<void>("mark", { label });
 
 export type DiffTarget = { kind: "workTree"; dir: string } | { kind: "branch"; root: string; branch: string };
 export type FileStatus = "added" | "modified" | "deleted" | "renamed";
