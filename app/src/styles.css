@@ -1,0 +1,52 @@
+:root {
+  --bg: #1e1e1e;
+  --panel: #252526;
+  --border: #333;
+  --text: #ddd;
+  --muted: #888;
+  --active: #37373d;
+}
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 13px -apple-system, sans-serif; }
+body { display: flex; overflow: hidden; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+#sidebar { width: 200px; flex-shrink: 0; background: var(--panel); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+#tabs { list-style: none; margin: 0; padding: 6px; flex: 1; overflow-y: auto; }
+#tabs li { padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+#tabs li.active { background: var(--active); }
+#tabs .row { display: flex; align-items: center; gap: 4px; }
+#tabs .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tabs input { flex: 1; min-width: 0; font: inherit; background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+#tabs .diff, #tabs .close { opacity: 0; padding: 0 2px; }
+#tabs li:hover .diff, #tabs li:hover .close, #tabs li.active .diff { opacity: 0.6; }
+#tabs .subtitle { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tabs .subtitle:empty { display: none; }
+#new-tab { margin: 6px; background: var(--border); padding: 6px; border-radius: 4px; }
+#terminals { flex: 1; position: relative; min-width: 0; }
+.term { position: absolute; inset: 0; padding: 4px; display: none; }
+.term.active { display: block; }
+.diff-view { position: absolute; inset: 0; z-index: 10; background: var(--bg); display: flex; flex-direction: column; outline: none; }
+.diff-view header { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.diff-title { font-weight: 600; }
+.diff-count { color: var(--muted); flex: 1; }
+.diff-view header button { padding: 2px 8px; border-radius: 4px; background: var(--border); }
+.diff-body { flex: 1; display: flex; min-height: 0; }
+.diff-files { list-style: none; margin: 0; padding: 6px; width: 280px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border); }
+.diff-files li { display: flex; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; white-space: nowrap; }
+.diff-files li.selected { background: var(--active); }
+.diff-files .path { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.diff-files .stat { color: var(--muted); font-size: 11px; }
+.diff-files .status { width: 12px; font-weight: 600; }
+.diff-files .status.added { color: #73c991; }
+.diff-files .status.modified { color: #e2c08d; }
+.diff-files .status.deleted { color: #f14c4c; }
+.diff-files .status.renamed { color: #4fc1ff; }
+.diff-patch { flex: 1; overflow: auto; min-width: 0; }
+.diff-message { color: var(--muted); padding: 16px; }
+.git-panel { position: absolute; inset: 0; z-index: 20; background: rgba(0, 0, 0, 0.4); display: flex; justify-content: center; align-items: flex-start; padding-top: 60px; outline: none; }
+.git-panel-box { width: min(560px, 90%); max-height: 70%; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; }
+.git-panel header { padding: 8px 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.git-panel ul { list-style: none; margin: 0; padding: 6px; overflow-y: auto; }
+.git-panel li { display: flex; flex-direction: column; padding: 6px 8px; border-radius: 4px; cursor: pointer; }
+.git-panel li.selected { background: var(--active); }
+.git-panel li.message { color: var(--muted); cursor: default; }
+.git-panel .where { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
